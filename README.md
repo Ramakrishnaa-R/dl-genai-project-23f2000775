@@ -16,3 +16,8 @@ If you prefer to stay at the repository root, use:
 python -m pip install -r requirements.txt
 python -m streamlit run deployment/app.py
 ```
+
+For the CNN deployment, place the trained files next to `deployment/app.py` or set these environment variables:
+
+- `CNN_MODEL_PATH` for the saved NumPy checkpoint, for example `cnn_model.npz`
+- `CNN_VOCAB_PATH` for the saved vocabulary JSON, for example `cnn_vocab.json`

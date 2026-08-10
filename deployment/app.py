@@ -6,13 +6,11 @@ from pathlib import Path
 
 import numpy as np
 import streamlit as st
-import torch
-import torch.nn as nn
 
 
 OPTION_LABELS = ["A", "B", "C", "D", "E"]
 APP_DIR = Path(__file__).resolve().parent
-CNN_MODEL_PATH = Path(os.getenv("CNN_MODEL_PATH", APP_DIR / "cnn_model.pt"))
+CNN_MODEL_PATH = Path(os.getenv("CNN_MODEL_PATH", APP_DIR / "cnn_model.npz"))
 CNN_VOCAB_PATH = Path(os.getenv("CNN_VOCAB_PATH", APP_DIR / "cnn_vocab.json"))
 MAX_LENGTH = 128
 EMBEDDING_DIM = 32
@@ -29,23 +27,6 @@ def clean_text(text):
     text = re.sub(r"\s+", " ", text).strip()
 
     return text
-
-
-class SimpleCNN(nn.Module):
-    def __init__(self, vocabulary_size):
-        super().__init__()
-        self.embedding = nn.Embedding(vocabulary_size, EMBEDDING_DIM, padding_idx=0)
-        self.convolution = nn.Conv1d(EMBEDDING_DIM, NUM_FILTERS, kernel_size=KERNEL_SIZE)
-        self.output = nn.Linear(NUM_FILTERS, 1)
-
-    def forward(self, input_ids):
-        batch_size, number_of_options, sequence_length = input_ids.shape
-        input_ids = input_ids.view(batch_size * number_of_options, sequence_length)
-        embedded = self.embedding(input_ids).transpose(1, 2)
-        features = torch.relu(self.convolution(embedded))
-        pooled = torch.max(features, dim=2).values
-        scores = self.output(pooled).squeeze(1)
-        return scores.view(batch_size, number_of_options)
 
 
 def build_default_vocab():
@@ -70,22 +51,23 @@ def load_vocab(vocab_path):
 def load_model(model_path, vocab_path):
     if not model_path.exists():
         raise FileNotFoundError(
-            f"CNN checkpoint not found: {model_path}. Set CNN_MODEL_PATH to a saved .pt/.pth file."
+            f"CNN checkpoint not found: {model_path}. Set CNN_MODEL_PATH to a saved .npz file."
         )
 
-    checkpoint = torch.load(model_path, map_location="cpu")
+    model_data = np.load(model_path, allow_pickle=True)
 
-    if isinstance(checkpoint, dict) and "vocabulary" in checkpoint:
-        vocabulary = {str(key): int(value) for key, value in checkpoint["vocabulary"].items()}
+    if "vocabulary" in model_data:
+        vocabulary = {str(key): int(value) for key, value in model_data["vocabulary"].item().items()}
     else:
         vocabulary = load_vocab(vocab_path)
 
-    model = SimpleCNN(len(vocabulary))
-    state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    model.load_state_dict(state_dict)
-    model.eval()
-
-    return vocabulary, model
+    return vocabulary, {
+        "embedding_weight": model_data["embedding_weight"],
+        "convolution_weight": model_data["convolution_weight"],
+        "convolution_bias": model_data["convolution_bias"],
+        "output_weight": model_data["output_weight"],
+        "output_bias": model_data["output_bias"],
+    }
 
 
 def encode_text(text, vocabulary):
@@ -107,11 +89,8 @@ def predict_options(question, options, vocabulary, model):
         text = f"{question} {option}"
         option_sequences.append(encode_text(text, vocabulary))
 
-    input_ids = torch.tensor([option_sequences], dtype=torch.long)
-
-    with torch.no_grad():
-        logits = model(input_ids)
-        scores = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+    input_ids = np.array([option_sequences], dtype=np.int64)
+    scores = score_with_cnn(input_ids, model)
 
     ranked_indices = np.argsort(-scores)
     ranked_predictions = [
@@ -125,6 +104,42 @@ def predict_options(question, options, vocabulary, model):
     ]
 
     return ranked_predictions
+
+
+def score_with_cnn(input_ids, model):
+    batch_size, number_of_options, sequence_length = input_ids.shape
+    scores = np.zeros((batch_size, number_of_options), dtype=np.float32)
+
+    embedding_weight = model["embedding_weight"]
+    convolution_weight = model["convolution_weight"]
+    convolution_bias = model["convolution_bias"]
+    output_weight = model["output_weight"].reshape(NUM_FILTERS)
+    output_bias = float(model["output_bias"].reshape(()))
+
+    for batch_index in range(batch_size):
+        for option_index in range(number_of_options):
+            token_ids = input_ids[batch_index, option_index]
+            token_ids = token_ids[:MAX_LENGTH]
+
+            embedded = embedding_weight[token_ids]
+            if embedded.shape[0] < KERNEL_SIZE:
+                pad_width = KERNEL_SIZE - embedded.shape[0]
+                embedded = np.pad(embedded, ((0, pad_width), (0, 0)), mode="constant")
+
+            window_scores = []
+            for start in range(0, embedded.shape[0] - KERNEL_SIZE + 1):
+                window = embedded[start : start + KERNEL_SIZE]
+                conv = np.tensordot(convolution_weight, window, axes=([1, 2], [1, 0]))
+                conv = conv + convolution_bias
+                window_scores.append(np.maximum(conv, 0.0))
+
+            features = np.max(np.stack(window_scores, axis=0), axis=0)
+            scores[batch_index, option_index] = float(np.dot(output_weight, features) + output_bias)
+
+    logits = scores[0]
+    logits = logits - np.max(logits)
+    exp_logits = np.exp(logits)
+    return exp_logits / np.sum(exp_logits)
 
 
 st.set_page_config(page_title="Smart MCQ Solver", page_icon="?", layout="centered")
